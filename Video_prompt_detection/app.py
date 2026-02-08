@@ -1,5 +1,23 @@
+import os
+
 import httpx
 import streamlit as st
+
+from src.engines.visual_engine import VisualSecurityEngine
+from src.video.video_processor import VideoAnalyzer
+
+
+SPACE_MODE = os.environ.get("SPACE_MODE", "").lower() in {"1", "true", "yes"}
+
+
+@st.cache_resource
+def get_engine() -> VisualSecurityEngine:
+    return VisualSecurityEngine()
+
+
+@st.cache_resource
+def get_video_analyzer() -> VideoAnalyzer:
+    return VideoAnalyzer()
 
 
 st.set_page_config(page_title="Visual Security Engine", layout="wide")
@@ -8,13 +26,16 @@ st.title("Visual Security Engine Demo")
 tab_image, tab_video = st.tabs(["Image", "Video"])
 
 with st.sidebar:
-    st.header("API Settings")
-    mode = st.selectbox("API mode", ["gateway", "split"], index=0)
-    gateway_url = st.text_input("Gateway URL", value="http://localhost:8000")
-    engine_d_url = st.text_input("Engine D URL", value="http://localhost:8001")
-    engine_e_url = st.text_input("Engine E URL", value="http://localhost:8002")
-    video_url = st.text_input("Video API URL", value="http://localhost:8010")
-    st.caption("Gateway mode calls a single API. Split mode calls D/E separately.")
+    if not SPACE_MODE:
+        st.header("API Settings")
+        mode = st.selectbox("API mode", ["gateway", "split"], index=0)
+        gateway_url = st.text_input("Gateway URL", value="http://localhost:8000")
+        engine_d_url = st.text_input("Engine D URL", value="http://localhost:8001")
+        engine_e_url = st.text_input("Engine E URL", value="http://localhost:8002")
+        video_url = st.text_input("Video API URL", value="http://localhost:8010")
+        st.caption("Gateway mode calls a single API. Split mode calls D/E separately.")
+    else:
+        mode = "local"
     st.header("Performance")
     run_ocr = st.checkbox("Show OCR output", value=True)
     run_injection = st.checkbox("Run prompt-injection model", value=True)
@@ -41,7 +62,31 @@ with tab_image:
             injection_result = {"skipped": True}
             cross_modal_result = {"skipped": True}
 
-            if mode == "gateway":
+            if mode == "local":
+                engine = get_engine()
+                text_payload = engine.extract_text(image_bytes)
+                injection_result = (
+                    engine.detect_injection_from_text(text_payload.get("normalized_text", ""))
+                    if run_injection
+                    else {"skipped": True}
+                )
+                cross_modal_result = (
+                    engine.check_cross_modal(image_bytes, transcript)
+                    if run_cross_modal
+                    else {"skipped": True}
+                )
+                ocr_vs_image = (
+                    engine.check_ocr_vs_image(image_bytes, text_payload.get("normalized_text", ""))
+                    if run_cross_modal
+                    else {"skipped": True}
+                )
+                caption_alignment = (
+                    engine.check_caption_alignment(image_bytes, text_payload.get("normalized_text", ""))
+                    if run_caption
+                    else {"skipped": True}
+                )
+                final_score = None
+            elif mode == "gateway":
                 try:
                     response = httpx.post(
                         f"{gateway_url.rstrip('/')}/analyze",
@@ -153,30 +198,54 @@ with tab_video:
 
     if run_video and video_file:
         video_bytes = video_file.read()
-        with st.spinner("Calling Video API for analysis..."):
-            try:
-                response = httpx.post(
-                    f"{video_url.rstrip('/')}/analyze_video",
-                    files={"video": (video_file.name, video_bytes, video_file.type or "video/mp4")},
-                    data={
-                        "audio_transcript": video_transcript,
-                        "target_fps": float(target_fps),
-                        "max_frames": int(max_frames) or None,
-                        "run_injection": str(run_injection).lower(),
-                        "run_cross_modal": str(run_cross_modal).lower(),
-                        "run_caption": str(run_caption).lower(),
-                        "run_vision_deepfake": str(run_vision_deepfake).lower(),
-                        "run_avsync": str(run_avsync).lower(),
-                        "log_frames": str(log_frames).lower(),
-                    },
-                    timeout=600,
+        with st.spinner("Running video analysis..."):
+            if mode == "local":
+                analyzer = get_video_analyzer()
+                frames, summary = analyzer.analyze_video_bytes(
+                    video_bytes,
+                    audio_transcript=video_transcript,
+                    target_fps=float(target_fps),
+                    max_frames=int(max_frames) or None,
+                    run_injection=run_injection,
+                    run_cross_modal=run_cross_modal,
+                    run_caption=run_caption,
+                    run_vision_deepfake=run_vision_deepfake,
+                    run_avsync=run_avsync,
+                    log_path=None,
                 )
-                response.raise_for_status()
-            except Exception as exc:
-                st.error("Video API call failed. Is it running on the configured URL?")
-                st.exception(exc)
+                top_risky = sorted(frames, key=lambda f: f.final_score, reverse=True)[:5]
+                payload = {
+                    "summary": summary,
+                    "top_risky_frames_flat": [f.__dict__ for f in top_risky],
+                    "timeline_flat": [f.__dict__ for f in frames],
+                }
             else:
-                payload = response.json()
+                try:
+                    response = httpx.post(
+                        f"{video_url.rstrip('/')}/analyze_video",
+                        files={"video": (video_file.name, video_bytes, video_file.type or "video/mp4")},
+                        data={
+                            "audio_transcript": video_transcript,
+                            "target_fps": float(target_fps),
+                            "max_frames": int(max_frames) or None,
+                            "run_injection": str(run_injection).lower(),
+                            "run_cross_modal": str(run_cross_modal).lower(),
+                            "run_caption": str(run_caption).lower(),
+                            "run_vision_deepfake": str(run_vision_deepfake).lower(),
+                            "run_avsync": str(run_avsync).lower(),
+                            "log_frames": str(log_frames).lower(),
+                        },
+                        timeout=600,
+                    )
+                    response.raise_for_status()
+                except Exception as exc:
+                    st.error("Video API call failed. Is it running on the configured URL?")
+                    st.exception(exc)
+                    payload = {}
+                else:
+                    payload = response.json()
+
+            if payload:
                 st.subheader("Summary")
                 st.json(payload.get("summary", {}))
                 summary = payload.get("summary", {})
@@ -196,29 +265,52 @@ with tab_video:
                     st.info(f"Frame log written to: {payload['log_path']}")
 
     if run_webcam:
-        with st.spinner("Calling Webcam API for analysis..."):
-            try:
-                response = httpx.post(
-                    f"{video_url.rstrip('/')}/analyze_webcam",
-                    data={
-                        "camera_index": int(camera_index),
-                        "duration_sec": float(duration_sec),
-                        "target_fps": float(target_fps),
-                        "run_injection": str(run_injection).lower(),
-                        "run_cross_modal": str(run_cross_modal).lower(),
-                        "run_caption": str(run_caption).lower(),
-                        "run_vision_deepfake": str(run_vision_deepfake).lower(),
-                        "run_avsync": str(run_avsync).lower(),
-                        "log_frames": str(log_frames).lower(),
-                    },
-                    timeout=600,
+        with st.spinner("Running webcam analysis..."):
+            if mode == "local":
+                analyzer = get_video_analyzer()
+                frames, summary = analyzer.analyze_webcam(
+                    camera_index=int(camera_index),
+                    duration_sec=float(duration_sec),
+                    target_fps=float(target_fps),
+                    run_injection=run_injection,
+                    run_cross_modal=run_cross_modal,
+                    run_caption=run_caption,
+                    run_vision_deepfake=run_vision_deepfake,
+                    run_avsync=run_avsync,
+                    log_path=None,
                 )
-                response.raise_for_status()
-            except Exception as exc:
-                st.error("Webcam API call failed. Is it running on the configured URL?")
-                st.exception(exc)
+                top_risky = sorted(frames, key=lambda f: f.final_score, reverse=True)[:5]
+                payload = {
+                    "summary": summary,
+                    "top_risky_frames_flat": [f.__dict__ for f in top_risky],
+                    "timeline_flat": [f.__dict__ for f in frames],
+                }
             else:
-                payload = response.json()
+                try:
+                    response = httpx.post(
+                        f"{video_url.rstrip('/')}/analyze_webcam",
+                        data={
+                            "camera_index": int(camera_index),
+                            "duration_sec": float(duration_sec),
+                            "target_fps": float(target_fps),
+                            "run_injection": str(run_injection).lower(),
+                            "run_cross_modal": str(run_cross_modal).lower(),
+                            "run_caption": str(run_caption).lower(),
+                            "run_vision_deepfake": str(run_vision_deepfake).lower(),
+                            "run_avsync": str(run_avsync).lower(),
+                            "log_frames": str(log_frames).lower(),
+                        },
+                        timeout=600,
+                    )
+                    response.raise_for_status()
+                except Exception as exc:
+                    st.error("Webcam API call failed. Is it running on the configured URL?")
+                    st.exception(exc)
+                    payload = {}
+                else:
+                    payload = response.json()
+
+            if payload:
                 st.subheader("Webcam Summary")
                 st.json(payload.get("summary", {}))
                 summary = payload.get("summary", {})

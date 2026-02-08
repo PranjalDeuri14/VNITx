@@ -1,5 +1,17 @@
+import os
+
 import httpx
 import streamlit as st
+
+from src.engines.visual_engine import VisualSecurityEngine
+
+
+SPACE_MODE = os.environ.get("SPACE_MODE", "").lower() in {"1", "true", "yes"}
+
+
+@st.cache_resource
+def get_engine() -> VisualSecurityEngine:
+    return VisualSecurityEngine()
 
 
 st.set_page_config(page_title="Visual Security Engine", layout="wide")
@@ -9,12 +21,15 @@ uploaded = st.file_uploader("Upload an image", type=["png", "jpg", "jpeg", "webp
 transcript = st.text_area("Audio transcript (optional)", value="a cat sitting on a ledge")
 
 with st.sidebar:
-    st.header("API Settings")
-    mode = st.selectbox("API mode", ["gateway", "split"], index=0)
-    gateway_url = st.text_input("Gateway URL", value="http://localhost:8000")
-    engine_d_url = st.text_input("Engine D URL", value="http://localhost:8001")
-    engine_e_url = st.text_input("Engine E URL", value="http://localhost:8002")
-    st.caption("Gateway mode calls a single API. Split mode calls D/E separately.")
+    if not SPACE_MODE:
+        st.header("API Settings")
+        mode = st.selectbox("API mode", ["gateway", "split"], index=0)
+        gateway_url = st.text_input("Gateway URL", value="http://localhost:8000")
+        engine_d_url = st.text_input("Engine D URL", value="http://localhost:8001")
+        engine_e_url = st.text_input("Engine E URL", value="http://localhost:8002")
+        st.caption("Gateway mode calls a single API. Split mode calls D/E separately.")
+    else:
+        mode = "local"
     st.header("Performance")
     run_ocr = st.checkbox("Show OCR output", value=True)
     run_injection = st.checkbox("Run prompt-injection model", value=True)
@@ -38,7 +53,30 @@ if run_clicked and uploaded:
         injection_result = {"skipped": True}
         cross_modal_result = {"skipped": True}
 
-        if mode == "gateway":
+        if mode == "local":
+            engine = get_engine()
+            text_payload = engine.extract_text(image_bytes)
+            injection_result = (
+                engine.detect_injection_from_text(text_payload.get("normalized_text", ""))
+                if run_injection
+                else {"skipped": True}
+            )
+            if run_cross_modal:
+                cross_modal_result = engine.check_cross_modal(image_bytes, transcript)
+            else:
+                cross_modal_result = {"skipped": True}
+            ocr_vs_image = (
+                engine.check_ocr_vs_image(image_bytes, text_payload.get("normalized_text", ""))
+                if run_cross_modal
+                else {"skipped": True}
+            )
+            caption_alignment = (
+                engine.check_caption_alignment(image_bytes, text_payload.get("normalized_text", ""))
+                if run_caption
+                else {"skipped": True}
+            )
+            final_score = None
+        elif mode == "gateway":
             try:
                 response = httpx.post(
                     f"{gateway_url.rstrip('/')}/analyze",
