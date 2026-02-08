@@ -2,6 +2,7 @@
 
 **Project:** Securing Voice and Multimodal AI Agents Against Deepfakes and Prompt Injection  
 **Event:** HackIITK 2026
+**Team Members:** Jaivardhan Shukla, Arshan Shaikh, Praneeth Mangala, and Pranjal Deuri
 
 This repository contains a multimodal security framework that detects and mitigates malicious **audio**, **visual**, and **cross‑modal** inputs targeting AI agents.
 
