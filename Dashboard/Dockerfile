@@ -10,6 +10,7 @@ COPY Dashboard/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY Dashboard/ /app/
+COPY screen_capture_component/ /app/screen_capture_component/
 
 ENV PYTHONUNBUFFERED=1
 

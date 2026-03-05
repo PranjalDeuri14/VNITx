@@ -33,6 +33,10 @@ async def analyze_video(
     run_vision_deepfake: bool = Form(True),
     run_avsync: bool = Form(True),
     log_frames: bool = Form(True),
+    crop_x: int | None = Form(None),
+    crop_y: int | None = Form(None),
+    crop_w: int | None = Form(None),
+    crop_h: int | None = Form(None),
 ) -> dict:
     if _ANALYZER is None:
         load_analyzer()
@@ -42,8 +46,14 @@ async def analyze_video(
     if log_frames:
         log_path = f"/tmp/video_frame_log_{int(asyncio.get_event_loop().time()*1000)}.jsonl"
 
+    crop = None
+    if crop_x is not None and crop_y is not None and crop_w is not None and crop_h is not None:
+        crop = {"x": int(crop_x), "y": int(crop_y), "w": int(crop_w), "h": int(crop_h)}
+
     frames, summary = analyzer.analyze_video_bytes(
         video_bytes,
+        filename=video.filename,
+        crop=crop,
         audio_transcript=audio_transcript,
         target_fps=target_fps,
         max_frames=max_frames,

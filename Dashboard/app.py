@@ -1,6 +1,9 @@
 import base64
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 from datetime import datetime
 from io import BytesIO
 from typing import Any, Dict, Optional, Tuple
@@ -15,6 +18,8 @@ try:
 except Exception:
     AudioSegment = None
     _PYDUB_AVAILABLE = False
+
+from screen_capture_component import screen_capture
 
 
 st.set_page_config(page_title="VNITx Security Dashboard", layout="wide")
@@ -76,6 +81,7 @@ def _post_video(
     run_vision_deepfake: bool,
     run_avsync: bool,
     log_frames: bool,
+    crop: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     try:
         with httpx.Client(timeout=600) as client:
@@ -92,6 +98,10 @@ def _post_video(
                     "run_vision_deepfake": _bool_str(run_vision_deepfake),
                     "run_avsync": _bool_str(run_avsync),
                     "log_frames": _bool_str(log_frames),
+                    "crop_x": "" if not crop else str(int(crop.get("x", 0))),
+                    "crop_y": "" if not crop else str(int(crop.get("y", 0))),
+                    "crop_w": "" if not crop else str(int(crop.get("w", 0))),
+                    "crop_h": "" if not crop else str(int(crop.get("h", 0))),
                 },
             )
         resp.raise_for_status()
@@ -164,6 +174,93 @@ def _extract_audio_mp3_from_video(video_bytes: bytes, filename: str) -> Tuple[Op
         return buffer.getvalue(), None
     except Exception as exc:
         return None, f"Audio extraction failed: {exc}"
+
+
+def _guess_ext(filename: str) -> str:
+    if "." not in filename:
+        return ""
+    return filename.rsplit(".", 1)[-1].lower().strip()
+
+
+def _convert_video_to_mp4(
+    video_bytes: bytes,
+    filename: str,
+    crop: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[bytes], Optional[str]]:
+    """
+    Convert arbitrary video bytes to MP4 (H.264 + optional AAC) via ffmpeg.
+    If `crop` is provided, crop is applied during conversion.
+    """
+    if shutil.which("ffmpeg") is None:
+        return None, "ffmpeg not found. Install it (e.g. `brew install ffmpeg`) and retry."
+
+    ext = _guess_ext(filename) or "webm"
+    src = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}")
+    dst = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    src_path = src.name
+    dst_path = dst.name
+    try:
+        src.write(video_bytes)
+        src.flush()
+        src.close()
+        dst.close()
+
+        # Keep uploads small and decoder-friendly: downscale to max width 640, lower fps.
+        vf = "scale='if(gt(iw,640),640,iw)':-2"
+        if crop:
+            try:
+                x = max(0, int(crop.get("x", 0)))
+                y = max(0, int(crop.get("y", 0)))
+                w = max(2, int(crop.get("w", 0)))
+                h = max(2, int(crop.get("h", 0)))
+                vf = f"crop={w}:{h}:{x}:{y}," + vf
+            except Exception:
+                pass
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            src_path,
+            "-vf",
+            vf,
+            "-r",
+            "15",
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "28",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            dst_path,
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        with open(dst_path, "rb") as handle:
+            return handle.read(), None
+    except subprocess.CalledProcessError:
+        return None, "ffmpeg conversion failed. Try a shorter capture (<=10s) and re-run."
+    finally:
+        try:
+            os.unlink(src_path)
+        except Exception:
+            pass
+        try:
+            os.unlink(dst_path)
+        except Exception:
+            pass
 
 
 def _health_check(base_url: str, path: str) -> Tuple[bool, str]:
@@ -347,7 +444,23 @@ with tab_image:
 with tab_video:
     st.subheader("Video Deepfake + Prompt Injection")
     st.markdown("Upload a video. The timeline will highlight risky frames.")
-    video_file = st.file_uploader("Upload video", type=["mp4", "mov", "avi", "mkv"])
+    video_source = st.radio(
+        "Video source",
+        ["Upload file", "Capture tab/screen (select region)"],
+        horizontal=True,
+    )
+    video_file = None
+    captured_video = None
+    if video_source == "Upload file":
+        video_file = st.file_uploader("Upload video", type=["mp4", "mov", "avi", "mkv", "webm"])
+    else:
+        st.caption("Tip: keep captures short (default 10s) to avoid large uploads.")
+        captured_video = screen_capture(
+            key="screen_capture_video",
+            max_seconds=10,
+            fps=20,
+            video_bits_per_second=1_500_000,
+        )
     video_transcript = st.text_area(
         "Audio transcript (optional)", height=100, key="video_audio_transcript"
     )
@@ -358,30 +471,87 @@ with tab_video:
         index=0,
         disabled=not extract_audio,
     )
+    fast_default = video_source != "Upload file"
+    fast_mode = st.checkbox(
+        "Fast mode (recommended for capture / HF Spaces)",
+        value=fast_default,
+        help="Reduces FPS + caps frames + disables heaviest checks to avoid long waits.",
+    )
+    if fast_mode:
+        st.caption("Fast mode suggestions: 1–2 FPS, max 20–40 frames. Enable more checks only if needed.")
+
     col1, col2, col3 = st.columns(3)
     with col1:
-        target_fps = st.number_input("Target FPS", min_value=1.0, max_value=30.0, value=5.0)
+        target_fps = st.number_input(
+            "Target FPS",
+            min_value=1.0,
+            max_value=30.0,
+            value=2.0 if fast_mode else 5.0,
+            key="video_target_fps_dash",
+        )
     with col2:
-        max_frames = st.number_input("Max Frames (0 = no limit)", min_value=0, max_value=5000, value=0)
+        max_frames = st.number_input(
+            "Max Frames (0 = no limit)",
+            min_value=0,
+            max_value=5000,
+            value=30 if fast_mode else 0,
+            key="video_max_frames_dash",
+        )
     with col3:
-        log_frames = st.checkbox("Log per-frame JSONL", value=True)
+        log_frames = st.checkbox("Log per-frame JSONL", value=not fast_mode)
 
     st.caption("Toggle detectors")
     run_injection = st.checkbox("Run prompt injection", value=True)
-    run_cross_modal = st.checkbox("Run cross-modal checks", value=True)
-    run_caption = st.checkbox("Run caption alignment", value=True)
-    run_vision_deepfake = st.checkbox("Run vision deepfake", value=True)
-    run_avsync = st.checkbox("Run AV sync", value=True)
+    run_cross_modal = st.checkbox("Run cross-modal checks", value=not fast_mode)
+    run_caption = st.checkbox("Run caption alignment", value=False if fast_mode else True)
+    run_vision_deepfake = st.checkbox("Run vision deepfake", value=False if fast_mode else True)
+    run_avsync = st.checkbox("Run AV sync", value=False if fast_mode else True)
 
-    if video_file:
+    video_bytes: Optional[bytes] = None
+    video_name: str = "capture.webm"
+    video_type: str = "video/webm"
+    crop_meta: Optional[Dict[str, Any]] = None
+    if video_file is not None:
         st.video(video_file)
+        video_bytes = video_file.getvalue()
+        video_name = video_file.name
+        video_type = video_file.type or "video/mp4"
+    elif captured_video and isinstance(captured_video, dict) and captured_video.get("data_base64"):
+        video_bytes = base64.b64decode(captured_video["data_base64"])
+        video_name = captured_video.get("filename") or "capture.webm"
+        video_type = captured_video.get("mime") or "video/webm"
+        st.info("Captured video ready. Click Analyze Video to send to API.")
+        crop_meta = captured_video.get("crop") if isinstance(captured_video.get("crop"), dict) else None
+
+    if video_bytes:
         if st.button("Analyze Video"):
+            to_send_bytes = video_bytes
+            to_send_name = video_name
+            to_send_type = video_type
+            to_send_crop = crop_meta
+
+            needs_convert = bool(to_send_crop) or "webm" in (to_send_type or "").lower() or _guess_ext(
+                to_send_name
+            ) in {"webm", "mkv"}
+            if needs_convert:
+                with st.spinner("Converting capture to MP4 for API..."):
+                    converted, conv_err = _convert_video_to_mp4(to_send_bytes, to_send_name, crop=to_send_crop)
+                if conv_err or not converted:
+                    st.error(conv_err or "Video conversion failed.")
+                    st.stop()
+                to_send_bytes = converted
+                to_send_name = "capture.mp4"
+                to_send_type = "video/mp4"
+                to_send_crop = None
+
+            st.caption(f"Video upload size: {len(to_send_bytes) / (1024 * 1024):.2f} MB")
+
             with st.spinner("Calling video API..."):
                 payload, err = _post_video(
                     video_base,
-                    video_file.getvalue(),
-                    video_file.name,
-                    video_file.type or "video/mp4",
+                    to_send_bytes,
+                    to_send_name,
+                    to_send_type,
                     video_transcript,
                     float(target_fps),
                     None if max_frames == 0 else int(max_frames),
@@ -391,6 +561,7 @@ with tab_video:
                     run_vision_deepfake,
                     run_avsync,
                     log_frames,
+                    crop=to_send_crop,
                 )
             if err:
                 st.error(err)
@@ -405,9 +576,7 @@ with tab_video:
                     if not audio_api_key:
                         st.error("Audio API key required for audio extraction.")
                     else:
-                        audio_bytes, audio_err = _extract_audio_mp3_from_video(
-                            video_file.getvalue(), video_file.name
-                        )
+                        audio_bytes, audio_err = _extract_audio_mp3_from_video(to_send_bytes, to_send_name)
                         if audio_err:
                             st.error(audio_err)
                         else:

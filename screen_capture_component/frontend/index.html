@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Screen Capture</title>
+    <style>
+      :root {
+        --bg: #0b1220;
+        --panel: #111b2e;
+        --text: #e7eefc;
+        --muted: #a8b3c7;
+        --accent: #6ea8fe;
+        --danger: #ff6b6b;
+        --ok: #22c55e;
+        --border: rgba(255, 255, 255, 0.12);
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+        color: var(--text);
+      }
+      .wrap {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 12px;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      button {
+        appearance: none;
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--text);
+        border-radius: 10px;
+        padding: 8px 10px;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      button.primary {
+        background: rgba(110, 168, 254, 0.18);
+        border-color: rgba(110, 168, 254, 0.55);
+      }
+      button.danger {
+        background: rgba(255, 107, 107, 0.18);
+        border-color: rgba(255, 107, 107, 0.55);
+      }
+      button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+      .hint {
+        margin-top: 8px;
+        font-size: 12px;
+        color: var(--muted);
+        line-height: 1.35;
+      }
+      .stage {
+        margin-top: 10px;
+        position: relative;
+        width: 100%;
+        max-height: 420px;
+        aspect-ratio: 16 / 9;
+        background: var(--bg);
+        border-radius: 12px;
+        overflow: hidden;
+        border: 1px solid var(--border);
+      }
+      video,
+      canvas {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+      }
+      canvas.overlay {
+        pointer-events: none;
+      }
+      .badge {
+        font-size: 12px;
+        padding: 4px 8px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        background: rgba(0, 0, 0, 0.25);
+      }
+      .badge.ok {
+        border-color: rgba(34, 197, 94, 0.6);
+        background: rgba(34, 197, 94, 0.15);
+      }
+      .badge.warn {
+        border-color: rgba(255, 107, 107, 0.6);
+        background: rgba(255, 107, 107, 0.12);
+      }
+      .meta {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin-top: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="row">
+        <button id="btnStartCapture" class="primary">Select tab/window/screen</button>
+        <button id="btnSelectRegion" disabled>Drag-select region</button>
+        <button id="btnStartRec" disabled class="primary">Start recording</button>
+        <button id="btnStopRec" disabled class="danger">Stop</button>
+        <button id="btnClear" disabled>Clear</button>
+        <span id="status" class="badge">Idle</span>
+      </div>
+
+      <div class="hint">
+        - Browser will prompt you to choose a tab/window/screen. You must pick it manually.<br />
+        - Click “Drag-select region” then drag a rectangle over the preview.<br />
+        - Recorded output is typically WebM. Keep captures short to avoid large payloads.
+      </div>
+
+      <div class="stage" id="stage">
+        <video id="preview" autoplay playsinline muted></video>
+        <canvas id="overlay" class="overlay"></canvas>
+      </div>
+
+      <div class="meta" id="meta"></div>
+    </div>
+
+    <script>
+      // Minimal Streamlit component bridge (no external deps).
+      const StreamlitBridge = (() => {
+        const send = (type, payload) => {
+          window.parent.postMessage(
+            {
+              isStreamlitMessage: true,
+              type,
+              ...payload,
+            },
+            "*",
+          );
+        };
+
+        const setValue = (value) => send("streamlit:setComponentValue", { value });
+        const setHeight = (height) => send("streamlit:setFrameHeight", { height });
+        const ready = () => send("streamlit:componentReady", { apiVersion: 1 });
+
+        let renderListener = null;
+        window.addEventListener("message", (event) => {
+          const data = event.data;
+          if (!data || data.isStreamlitMessage !== true) return;
+          if (data.type === "streamlit:render" && renderListener) {
+            renderListener(data.args || {});
+          }
+        });
+
+        return {
+          ready,
+          setValue,
+          setHeight,
+          onRender: (fn) => {
+            renderListener = fn;
+          },
+        };
+      })();
+
+      const els = {
+        btnStartCapture: document.getElementById("btnStartCapture"),
+        btnSelectRegion: document.getElementById("btnSelectRegion"),
+        btnStartRec: document.getElementById("btnStartRec"),
+        btnStopRec: document.getElementById("btnStopRec"),
+        btnClear: document.getElementById("btnClear"),
+        status: document.getElementById("status"),
+        preview: document.getElementById("preview"),
+        overlay: document.getElementById("overlay"),
+        stage: document.getElementById("stage"),
+        meta: document.getElementById("meta"),
+      };
+
+      let config = { max_seconds: 10, fps: 20, video_bits_per_second: 1500000 };
+
+      let displayStream = null;
+      let crop = null; // {x,y,w,h} in *video pixel* coords
+      let selecting = false;
+      let dragStart = null; // {x,y} in canvas coords
+
+      let recorder = null;
+      let chunks = [];
+      let startedAt = null;
+      let stopTimer = null;
+
+      const setStatus = (label, kind = "idle") => {
+        els.status.textContent = label;
+        els.status.className = "badge";
+        if (kind === "ok") els.status.classList.add("ok");
+        if (kind === "warn") els.status.classList.add("warn");
+      };
+
+      const setMeta = (items) => {
+        els.meta.innerHTML = "";
+        for (const [k, v] of items) {
+          const span = document.createElement("span");
+          span.className = "badge";
+          span.textContent = `${k}: ${v}`;
+          els.meta.appendChild(span);
+        }
+      };
+
+      const enable = (el, yes) => (el.disabled = !yes);
+
+      const stopAll = async () => {
+        if (stopTimer) {
+          clearTimeout(stopTimer);
+          stopTimer = null;
+        }
+        if (recorder && recorder.state !== "inactive") {
+          try {
+            recorder.stop();
+          } catch {}
+        }
+        recorder = null;
+        chunks = [];
+        startedAt = null;
+
+        if (displayStream) {
+          for (const t of displayStream.getTracks()) {
+            try {
+              t.stop();
+            } catch {}
+          }
+          displayStream = null;
+        }
+        els.preview.srcObject = null;
+        crop = null;
+        selecting = false;
+        dragStart = null;
+        drawOverlay();
+      };
+
+      const fitOverlayCanvas = () => {
+        const rect = els.stage.getBoundingClientRect();
+        // Use CSS pixels; canvas will scale with devicePixelRatio for crisp lines.
+        const dpr = window.devicePixelRatio || 1;
+        els.overlay.width = Math.max(1, Math.floor(rect.width * dpr));
+        els.overlay.height = Math.max(1, Math.floor(rect.height * dpr));
+        els.overlay.style.width = `${rect.width}px`;
+        els.overlay.style.height = `${rect.height}px`;
+      };
+
+      const drawOverlay = () => {
+        const ctx = els.overlay.getContext("2d");
+        ctx.clearRect(0, 0, els.overlay.width, els.overlay.height);
+
+        if (!crop || !els.preview.videoWidth || !els.preview.videoHeight) return;
+
+        const dpr = window.devicePixelRatio || 1;
+        const rect = els.stage.getBoundingClientRect();
+        const wCss = rect.width;
+        const hCss = rect.height;
+        const vw = els.preview.videoWidth;
+        const vh = els.preview.videoHeight;
+
+        // Calculate contain-fit letterboxing to map video pixels -> stage CSS pixels.
+        const scale = Math.min(wCss / vw, hCss / vh);
+        const dispW = vw * scale;
+        const dispH = vh * scale;
+        const offX = (wCss - dispW) / 2;
+        const offY = (hCss - dispH) / 2;
+
+        const xCss = offX + crop.x * scale;
+        const yCss = offY + crop.y * scale;
+        const wSel = crop.w * scale;
+        const hSel = crop.h * scale;
+
+        ctx.save();
+        ctx.scale(dpr, dpr);
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = "rgba(110,168,254,0.95)";
+        ctx.fillStyle = "rgba(110,168,254,0.12)";
+        ctx.fillRect(xCss, yCss, wSel, hSel);
+        ctx.strokeRect(xCss, yCss, wSel, hSel);
+        ctx.restore();
+      };
+
+      const stageToVideoPx = (xCss, yCss) => {
+        const rect = els.stage.getBoundingClientRect();
+        const vw = els.preview.videoWidth;
+        const vh = els.preview.videoHeight;
+        const scale = Math.min(rect.width / vw, rect.height / vh);
+        const dispW = vw * scale;
+        const dispH = vh * scale;
+        const offX = (rect.width - dispW) / 2;
+        const offY = (rect.height - dispH) / 2;
+
+        // Clamp to displayed video area
+        const clampedX = Math.max(offX, Math.min(offX + dispW, xCss));
+        const clampedY = Math.max(offY, Math.min(offY + dispH, yCss));
+
+        return {
+          x: (clampedX - offX) / scale,
+          y: (clampedY - offY) / scale,
+          scale,
+          offX,
+          offY,
+          dispW,
+          dispH,
+        };
+      };
+
+      const pickMime = () => {
+        const candidates = [
+          "video/webm;codecs=vp9",
+          "video/webm;codecs=vp8",
+          "video/webm",
+        ];
+        for (const c of candidates) {
+          if (window.MediaRecorder && MediaRecorder.isTypeSupported(c)) return c;
+        }
+        return "";
+      };
+
+      const blobToBase64 = async (blob) => {
+        const arrayBuffer = await blob.arrayBuffer();
+        let binary = "";
+        const bytes = new Uint8Array(arrayBuffer);
+        const chunkSize = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+          binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+        }
+        return btoa(binary);
+      };
+
+      const startCapture = async () => {
+        await stopAll();
+        setStatus("Requesting capture…");
+        fitOverlayCanvas();
+
+        try {
+          displayStream = await navigator.mediaDevices.getDisplayMedia({
+            video: { frameRate: config.fps },
+            audio: false,
+          });
+        } catch (err) {
+          setStatus("Capture cancelled", "warn");
+          return;
+        }
+
+        els.preview.srcObject = displayStream;
+
+        await new Promise((resolve) => {
+          els.preview.onloadedmetadata = () => resolve();
+        });
+        setMeta([
+          ["video", `${els.preview.videoWidth}×${els.preview.videoHeight}`],
+          ["fps", config.fps],
+        ]);
+
+        // Default crop to full frame.
+        crop = { x: 0, y: 0, w: els.preview.videoWidth, h: els.preview.videoHeight };
+        drawOverlay();
+
+        enable(els.btnSelectRegion, true);
+        enable(els.btnStartRec, true);
+        enable(els.btnClear, true);
+        setStatus("Capture ready", "ok");
+      };
+
+      const beginRegionSelect = async () => {
+        if (!displayStream) return;
+        selecting = true;
+        setStatus("Drag to select region", "ok");
+      };
+
+      const startRecording = async () => {
+        if (!displayStream) return;
+        if (recorder && recorder.state !== "inactive") return;
+
+        const mime = pickMime();
+        try {
+          // Record the raw shared stream; crop server-side using provided crop rectangle.
+          recorder = new MediaRecorder(displayStream, {
+            mimeType: mime || undefined,
+            videoBitsPerSecond: config.video_bits_per_second,
+          });
+        } catch (err) {
+          setStatus("MediaRecorder unsupported", "warn");
+          return;
+        }
+
+        chunks = [];
+        recorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) chunks.push(e.data);
+        };
+
+        recorder.onstop = async () => {
+          const blob = new Blob(chunks, { type: recorder.mimeType || "video/webm" });
+          chunks = [];
+
+          setStatus("Encoding…");
+          const b64 = await blobToBase64(blob);
+
+          StreamlitBridge.setValue({
+            data_base64: b64,
+            mime: blob.type || "video/webm",
+            filename: "screen_capture.webm",
+            crop: crop
+              ? {
+                  x: Math.max(0, Math.floor(crop.x)),
+                  y: Math.max(0, Math.floor(crop.y)),
+                  w: Math.max(2, Math.floor(crop.w)),
+                  h: Math.max(2, Math.floor(crop.h)),
+                  vw: Math.floor(els.preview.videoWidth || 0),
+                  vh: Math.floor(els.preview.videoHeight || 0),
+                }
+              : null,
+          });
+          setStatus("Sent to app", "ok");
+          enable(els.btnStopRec, false);
+          enable(els.btnStartRec, true);
+        };
+
+        recorder.start(250);
+        startedAt = Date.now();
+        enable(els.btnStartRec, false);
+        enable(els.btnStopRec, true);
+        setStatus("Recording…", "ok");
+
+        if (config.max_seconds > 0) {
+          stopTimer = setTimeout(() => {
+            try {
+              if (recorder && recorder.state !== "inactive") recorder.stop();
+            } catch {}
+          }, config.max_seconds * 1000);
+        }
+      };
+
+      const stopRecording = async () => {
+        if (!recorder || recorder.state === "inactive") return;
+        try {
+          recorder.stop();
+        } catch {}
+      };
+
+      // Overlay drag selection is handled on stage element (not canvas), for consistent CSS coords.
+      const onPointerDown = (e) => {
+        if (!selecting || !els.preview.videoWidth) return;
+        const rect = els.stage.getBoundingClientRect();
+        dragStart = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+      };
+      const onPointerMove = (e) => {
+        if (!selecting || !dragStart || !els.preview.videoWidth) return;
+        const rect = els.stage.getBoundingClientRect();
+        const x2 = e.clientX - rect.left;
+        const y2 = e.clientY - rect.top;
+
+        const x1 = dragStart.x;
+        const y1 = dragStart.y;
+
+        const left = Math.min(x1, x2);
+        const top = Math.min(y1, y2);
+        const right = Math.max(x1, x2);
+        const bottom = Math.max(y1, y2);
+
+        const p1 = stageToVideoPx(left, top);
+        const p2 = stageToVideoPx(right, bottom);
+        const w = Math.max(2, p2.x - p1.x);
+        const h = Math.max(2, p2.y - p1.y);
+        // Clamp crop to the video bounds.
+        const vw = els.preview.videoWidth;
+        const vh = els.preview.videoHeight;
+        const x = Math.max(0, Math.min(vw - 2, Math.floor(p1.x)));
+        const y = Math.max(0, Math.min(vh - 2, Math.floor(p1.y)));
+        const cw = Math.max(2, Math.min(vw - x, Math.floor(w)));
+        const ch = Math.max(2, Math.min(vh - y, Math.floor(h)));
+        crop = { x, y, w: cw, h: ch };
+        drawOverlay();
+      };
+      const onPointerUp = () => {
+        if (!selecting) return;
+        selecting = false;
+        dragStart = null;
+        setStatus("Region set", "ok");
+      };
+
+      els.btnStartCapture.addEventListener("click", startCapture);
+      els.btnSelectRegion.addEventListener("click", beginRegionSelect);
+      els.btnStartRec.addEventListener("click", startRecording);
+      els.btnStopRec.addEventListener("click", stopRecording);
+      els.btnClear.addEventListener("click", async () => {
+        await stopAll();
+        enable(els.btnSelectRegion, false);
+        enable(els.btnStartRec, false);
+        enable(els.btnStopRec, false);
+        enable(els.btnClear, false);
+        setMeta([]);
+        setStatus("Idle");
+        StreamlitBridge.setValue(null);
+      });
+
+      els.stage.addEventListener("pointerdown", onPointerDown);
+      els.stage.addEventListener("pointermove", onPointerMove);
+      window.addEventListener("pointerup", onPointerUp);
+      window.addEventListener("resize", () => {
+        fitOverlayCanvas();
+        drawOverlay();
+        StreamlitBridge.setHeight(document.body.scrollHeight);
+      });
+
+      StreamlitBridge.onRender((args) => {
+        const next = args || {};
+        config = {
+          max_seconds: Number(next.max_seconds ?? 10),
+          fps: Number(next.fps ?? 20),
+          video_bits_per_second: Number(next.video_bits_per_second ?? 1500000),
+        };
+        fitOverlayCanvas();
+        drawOverlay();
+        StreamlitBridge.setHeight(document.body.scrollHeight);
+      });
+
+      StreamlitBridge.ready();
+      StreamlitBridge.setHeight(document.body.scrollHeight);
+      setStatus("Idle");
+    </script>
+  </body>
+</html>
+

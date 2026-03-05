@@ -5,6 +5,8 @@ import time
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+import os
+import subprocess
 
 import cv2
 import numpy as np
@@ -33,6 +35,73 @@ class VideoAnalyzer:
         self.engine = engine or VisualSecurityEngine()
         self._deepfake = FrameDeepfakeDetector()
         self._avsync = AVSyncDetector()
+
+    @staticmethod
+    def _guess_suffix(filename: Optional[str]) -> str:
+        if not filename:
+            return ".mp4"
+        name = filename.strip().lower()
+        _, ext = os.path.splitext(name)
+        if ext and len(ext) <= 8:
+            return ext
+        return ".mp4"
+
+    @staticmethod
+    def _write_temp_bytes(data: bytes, suffix: str) -> str:
+        handle = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        try:
+            handle.write(data)
+            handle.flush()
+            return handle.name
+        finally:
+            handle.close()
+
+    @staticmethod
+    def _convert_to_mp4(src_path: str, crop: Optional[Dict[str, int]] = None) -> Optional[str]:
+        """
+        Best-effort conversion for webm/mov/etc -> mp4 using ffmpeg.
+        Returns new mp4 path or None if conversion fails.
+        """
+        dst_handle = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        dst_path = dst_handle.name
+        dst_handle.close()
+
+        vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        if crop:
+            x = max(0, int(crop.get("x", 0)))
+            y = max(0, int(crop.get("y", 0)))
+            w = max(2, int(crop.get("w", 0)))
+            h = max(2, int(crop.get("h", 0)))
+            vf = f"crop={w}:{h}:{x}:{y}," + vf
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            src_path,
+            "-vf",
+            vf,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            dst_path,
+        ]
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            return dst_path
+        except Exception:
+            try:
+                os.unlink(dst_path)
+            except Exception:
+                pass
+            return None
 
     @staticmethod
     def _encode_frame(frame_bgr: np.ndarray) -> bytes:
@@ -245,6 +314,8 @@ class VideoAnalyzer:
     def analyze_video_bytes(
         self,
         video_bytes: bytes,
+        filename: Optional[str] = None,
+        crop: Optional[Dict[str, int]] = None,
         audio_transcript: str = "",
         target_fps: float = 5.0,
         max_frames: Optional[int] = None,
@@ -256,11 +327,20 @@ class VideoAnalyzer:
         log_path: Optional[Path] = None,
         max_frame_width: int = 640,
     ) -> Tuple[List[VideoFrameResult], Dict[str, Any]]:
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=True) as handle:
-            handle.write(video_bytes)
-            handle.flush()
-            capture = cv2.VideoCapture(handle.name)
+        src_path = None
+        mp4_path = None
+        capture = None
         try:
+            suffix = self._guess_suffix(filename)
+            src_path = self._write_temp_bytes(video_bytes, suffix=suffix)
+
+            # If it's not an mp4, convert to mp4 for maximum decoder compatibility + AVSync audio access.
+            if suffix != ".mp4" or crop:
+                mp4_path = self._convert_to_mp4(src_path, crop=crop)
+            if mp4_path is None:
+                mp4_path = src_path
+
+            capture = cv2.VideoCapture(mp4_path)
             return self.analyze_capture(
                 capture,
                 audio_transcript=audio_transcript,
@@ -271,12 +351,26 @@ class VideoAnalyzer:
                 run_caption=run_caption,
                 run_vision_deepfake=run_vision_deepfake,
                 run_avsync=run_avsync,
-                video_path=handle.name,
+                video_path=mp4_path if run_avsync else None,
                 log_path=log_path,
                 max_frame_width=max_frame_width,
             )
         finally:
-            capture.release()
+            if capture is not None:
+                try:
+                    capture.release()
+                except Exception:
+                    pass
+            if mp4_path and mp4_path != src_path:
+                try:
+                    os.unlink(mp4_path)
+                except Exception:
+                    pass
+            if src_path:
+                try:
+                    os.unlink(src_path)
+                except Exception:
+                    pass
 
     def analyze_webcam(
         self,
